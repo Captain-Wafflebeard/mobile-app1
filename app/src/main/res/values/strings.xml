@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">Theft Guard</string>
 
-    <string name="instructions">Two secret keywords. Text your phone exactly:\n\n    %1$s\n\nand it sounds \"This phone is stolen\" at full volume and sends its location; the alarm stops only when you unlock the phone. Or text exactly:\n\n    %2$s\n\nfor a silent track: no sound, no screen, nothing a thief would notice. It quietly turns data on (needs Shizuku), sends the location once, and stays silent. Send either keyword again for a new location.</string>
+    <string name="instructions">Text your phone one of these exact keywords from any phone:\n\n• %1$s — loud alarm + location; stops only when you unlock the phone.\n• %1$s_live — loud alarm + a fresh location every minute (up to 30 min).\n• %2$s — silent: no sound or screen, sends the location once.\n• %2$s_live — silent live tracking, a pin every minute.\n• %2$s_&lt;number&gt; — silent, texts the location to that number (e.g. %2$s_9812345678).\n• stop_stolen — stop any run.\n\nSilent/live auto-enabling data needs Shizuku. Send a keyword again any time for a new location.</string>
     <string name="silent_channel_name">Background sync</string>
     <string name="silent_notification_title">Syncing</string>
     <string name="silent_notification_text">Updating in the background…</string>

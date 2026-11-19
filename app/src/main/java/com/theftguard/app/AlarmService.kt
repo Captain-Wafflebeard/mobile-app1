@@ -68,10 +68,22 @@ class AlarmService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Silent "secret mission": send location quietly once, then stop. Not persisted
-        // across reboots and never sounds or locks, so a thief sees nothing unusual.
+        // Stop keyword: shut everything down (any mode).
+        if (intent?.getBooleanExtra(EXTRA_STOP, false) == true) {
+            AlarmState.setActive(this, false)
+            sendBroadcast(Intent(ACTION_ALARM_STOPPED).setPackage(packageName))
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val wantLive = intent?.getBooleanExtra(EXTRA_LIVE, false) ?: false
+        val target = intent?.getStringExtra(EXTRA_TARGET)
+
+        // Silent "secret mission": send location quietly (once, or live) then stop. Not
+        // persisted across reboots and never sounds or locks, so a thief sees nothing.
         if (intent?.getBooleanExtra(EXTRA_SILENT, false) == true) {
-            if (!running) startSilent()
+            if (!running) startSilent(wantLive, target)
             return START_NOT_STICKY
         }
         // Restarted by the system after being killed: only continue if the alarm is still owed.
@@ -79,7 +91,7 @@ class AlarmService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (!running) startAlarm()
+        if (!running) startAlarm(wantLive, target)
         return START_STICKY
     }
 
@@ -90,13 +102,13 @@ class AlarmService : Service() {
 
     // ---------------------------------------------------------------- start / stop
 
-    private fun startAlarm() {
+    private fun startAlarm(live: Boolean, target: String?) {
         running = true
 
         startForegroundWithNotification()
-        // If Shizuku is set up, turn mobile data / Wi-Fi / location on so the phone
-        // stays reachable. No-op when Shizuku isn't available.
-        ShizukuManager.enableConnectivity(this)
+        // If Shizuku is set up, turn mobile data / Wi-Fi / location on and switch DND
+        // off so the alarm is heard (notably on Samsung). No-op without Shizuku.
+        ShizukuManager.applyForAlarm(this, silent = false)
         lockDeviceIfAdmin()
 
         wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
@@ -108,7 +120,7 @@ class AlarmService : Service() {
         startVolumeEnforcement()
         registerUnlockReceiver()
         initTextToSpeech()
-        locationReporter = LocationReporter(this).apply { start() }
+        locationReporter = LocationReporter(this, live = live, overrideNumber = target).apply { start() }
 
         soundThread = Thread(::soundLoop, "theft-alarm-sound").apply { start() }
     }
@@ -117,22 +129,26 @@ class AlarmService : Service() {
      * Silent mode: no sound, no alarm screen, no lock. Turn connectivity on via
      * Shizuku, silence the phone so nothing chirps, send the location once, then stop.
      */
-    private fun startSilent() {
+    private fun startSilent(live: Boolean, target: String?) {
         running = true
         silent = true
 
         startSilentForeground()
-        ShizukuManager.enableConnectivity(this)
+        ShizukuManager.applyForAlarm(this, silent = true)
         silenceEverything()
 
+        // Live tracking can run up to ~30 min; a one-shot only needs a short window.
+        val maxMs = if (live) SILENT_LIVE_MAX_MS else SILENT_MAX_MS
         wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TheftGuard:silent")
-            .apply { acquire(SILENT_MAX_MS) }
+            .apply { acquire(maxMs) }
 
-        locationReporter = LocationReporter(this) { mainHandler.post { finishSilent() } }.apply { start() }
+        locationReporter = LocationReporter(this, live = live, overrideNumber = target) {
+            mainHandler.post { finishSilent() }
+        }.apply { start() }
 
-        // Safety net in case the location never resolves (e.g. no signal).
-        mainHandler.postDelayed({ finishSilent() }, SILENT_MAX_MS)
+        // Safety net in case the location work never calls back.
+        mainHandler.postDelayed({ finishSilent() }, maxMs)
     }
 
     private fun finishSilent() {
@@ -447,19 +463,36 @@ class AlarmService : Service() {
         private const val SAMPLE_RATE = 44_100
         private const val VOLUME_POLL_MS = 200L
 
-        /** How long the silent run may stay up waiting for a fix / email before giving up. */
+        /** How long a silent run may stay up: a one-shot needs little, live up to ~30 min. */
         private const val SILENT_MAX_MS = 150_000L
+        private const val SILENT_LIVE_MAX_MS = 32 * 60_000L
 
         private const val EXTRA_SILENT = "com.theftguard.app.EXTRA_SILENT"
+        private const val EXTRA_LIVE = "com.theftguard.app.EXTRA_LIVE"
+        private const val EXTRA_TARGET = "com.theftguard.app.EXTRA_TARGET"
+        private const val EXTRA_STOP = "com.theftguard.app.EXTRA_STOP"
 
         /** Sent (package-local) when the alarm stops so the alarm screen can close. */
         const val ACTION_ALARM_STOPPED = "com.theftguard.app.ALARM_STOPPED"
 
-        /** Loud alarm (default) or the silent "secret mission" location run. */
-        fun start(context: Context, silent: Boolean = false) {
+        /**
+         * Start a run. [silent] = no sound/screen/lock; [live] = keep sending location
+         * until stopped/timeout; [target] = text this one number instead of saved recipients.
+         */
+        fun start(context: Context, silent: Boolean = false, live: Boolean = false, target: String? = null) {
             if (!silent) AlarmState.setActive(context, true)
-            val intent = Intent(context, AlarmService::class.java).putExtra(EXTRA_SILENT, silent)
+            val intent = Intent(context, AlarmService::class.java)
+                .putExtra(EXTRA_SILENT, silent)
+                .putExtra(EXTRA_LIVE, live)
+                .putExtra(EXTRA_TARGET, target)
             context.startForegroundService(intent)
+        }
+
+        /** Stop any running alarm or silent/live run (the stop keyword). */
+        fun stopAll(context: Context) {
+            AlarmState.setActive(context, false)
+            val intent = Intent(context, AlarmService::class.java).putExtra(EXTRA_STOP, true)
+            runCatching { context.startService(intent) }
         }
 
         /** Used when we know the owner already unlocked the phone (e.g. after reboot). */

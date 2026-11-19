@@ -1,6 +1,6 @@
 // AIDL for the Shizuku user service. It runs in a separate process at ADB/shell
 // privilege. It exposes only fixed, named actions (no arbitrary command input),
-// so it is not a general command channel - just three switches the alarm flips on.
+// so it is not a general command channel - just the switches the alarm flips.
 package com.theftguard.app;
 
 interface IUserService {
@@ -11,4 +11,6 @@ interface IUserService {
     boolean enableMobileData() = 2;
     boolean enableWifi() = 3;
     boolean enableLocation() = 4;
+    boolean turnDndOff() = 5;        // so the loud alarm is heard (helps Samsung)
+    boolean turnDndTotalSilence() = 6; // so the silent run makes no sound at all
 }

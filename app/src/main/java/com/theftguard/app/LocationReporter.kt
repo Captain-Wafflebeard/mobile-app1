@@ -20,14 +20,16 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Sends the phone's location exactly ONCE per alarm: it waits briefly for a fresh
- * GPS fix (falling back to the last known position) and then sends a single
- * message - either by SMS to the trusted numbers, or by email if the user chose
- * that and Shizuku has turned data/Wi-Fi on. To get another location, the owner
- * sends "Stolen" again.
+ * Sends the phone's location. By default once per alarm (a fresh fix, falling back
+ * to last known), by SMS to the trusted numbers or by email. In [live] mode it keeps
+ * sending a fresh pin every [LIVE_INTERVAL_MS] until [stop] is called or [LIVE_MAX_MS]
+ * elapses. If [overrideNumber] is set, it texts that one number instead of the saved
+ * recipients (used by the silent_stolen_<number> keyword).
  */
 class LocationReporter(
     private val context: Context,
+    private val live: Boolean = false,
+    private val overrideNumber: String? = null,
     private val onFinished: (() -> Unit)? = null,
 ) {
 
@@ -35,7 +37,8 @@ class LocationReporter(
     private val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
     private var activeListener: LocationListener? = null
     private var running = false
-    private var sent = false
+    private var roundSent = false
+    private var startTimeMs = 0L
 
     fun start() {
         if (!hasAnyRecipient()) {
@@ -44,7 +47,8 @@ class LocationReporter(
             return
         }
         running = true
-        requestSingleFix()
+        startTimeMs = System.currentTimeMillis()
+        requestFix()
     }
 
     fun stop() {
@@ -62,8 +66,23 @@ class LocationReporter(
         onFinished?.invoke()
     }
 
-    private fun hasAnyRecipient(): Boolean = when (AlarmState.deliveryMethod(context)) {
-        AlarmState.DELIVERY_EMAIL -> AlarmState.mailConfig(context).isComplete
+    /** After a round is sent: in live mode schedule the next, otherwise finish. */
+    private fun onRoundComplete() {
+        if (!running) {
+            finish()
+            return
+        }
+        val elapsed = System.currentTimeMillis() - startTimeMs
+        if (live && elapsed < LIVE_MAX_MS) {
+            handler.postDelayed({ if (running) requestFix() }, LIVE_INTERVAL_MS)
+        } else {
+            finish()
+        }
+    }
+
+    private fun hasAnyRecipient(): Boolean = when {
+        overrideNumber != null -> true
+        AlarmState.deliveryMethod(context) == AlarmState.DELIVERY_EMAIL -> AlarmState.mailConfig(context).isComplete
         else -> AlarmState.trustedNumbers(context).isNotEmpty()
     }
 
@@ -94,9 +113,10 @@ class LocationReporter(
             .maxByOrNull { it.time }
     }
 
-    /** Listens for one good fix within [FIX_TIMEOUT_MS], then sends a single message. */
+    /** Listens for one good fix within [FIX_TIMEOUT_MS], then sends one message. */
     @SuppressLint("MissingPermission")
-    private fun requestSingleFix() {
+    private fun requestFix() {
+        roundSent = false
         if (!hasLocationPermission() || !isLocationEnabled()) {
             send(location = null, fresh = false)
             return
@@ -104,7 +124,7 @@ class LocationReporter(
         stopListening()
 
         var best: Location? = null
-        val finish = Runnable {
+        val finishRound = Runnable {
             stopListening()
             send(best ?: lastKnownLocation(), fresh = best != null)
         }
@@ -112,8 +132,8 @@ class LocationReporter(
             override fun onLocationChanged(location: Location) {
                 if (best == null || location.accuracy < best!!.accuracy) best = location
                 if (location.accuracy <= GOOD_ACCURACY_M) {
-                    handler.removeCallbacks(finish)
-                    finish.run()
+                    handler.removeCallbacks(finishRound)
+                    finishRound.run()
                 }
             }
 
@@ -127,7 +147,7 @@ class LocationReporter(
             runCatching { locationManager.requestLocationUpdates(provider, 0L, 0f, listener, Looper.getMainLooper()) }
                 .onFailure { Log.w(TAG, "requestLocationUpdates($provider) failed", it) }
         }
-        handler.postDelayed(finish, FIX_TIMEOUT_MS)
+        handler.postDelayed(finishRound, FIX_TIMEOUT_MS)
     }
 
     private fun stopListening() {
@@ -135,11 +155,11 @@ class LocationReporter(
         activeListener = null
     }
 
-    // ---------------------------------------------------------------- send once
+    // ---------------------------------------------------------------- send
 
     private fun send(location: Location?, fresh: Boolean) {
-        if (sent) return
-        sent = true
+        if (roundSent) return
+        roundSent = true
         val battery = batteryPercent()
         val body = when {
             location != null -> format(
@@ -150,16 +170,22 @@ class LocationReporter(
             !hasLocationPermission() -> format(R.string.msg_no_permission, battery)
             else -> format(R.string.msg_location_off, battery)
         }
-        when (AlarmState.deliveryMethod(context)) {
-            AlarmState.DELIVERY_EMAIL -> sendEmail(body)
+        // A phone number in the keyword forces SMS to that number; otherwise use the
+        // configured delivery method.
+        when {
+            overrideNumber != null -> {
+                sendSms(body, listOf(overrideNumber))
+                onRoundComplete()
+            }
+            AlarmState.deliveryMethod(context) == AlarmState.DELIVERY_EMAIL -> sendEmail(body)
             else -> {
-                sendSms(body)
-                finish()
+                sendSms(body, AlarmState.trustedNumbers(context))
+                onRoundComplete()
             }
         }
     }
 
-    private fun sendSms(text: String) {
+    private fun sendSms(text: String, numbers: List<String>) {
         if (context.checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
             Log.w(TAG, "SEND_SMS not granted")
             return
@@ -171,7 +197,7 @@ class LocationReporter(
             SmsManager.getDefault()
         }
         val parts = sms.divideMessage(text)
-        for (number in AlarmState.trustedNumbers(context)) {
+        for (number in numbers) {
             runCatching { sms.sendMultipartTextMessage(number, null, parts, null, null) }
                 .onFailure { Log.w(TAG, "Failed to text $number", it) }
         }
@@ -182,7 +208,7 @@ class LocationReporter(
         val config = AlarmState.mailConfig(context)
         if (!config.isComplete) {
             Log.w(TAG, "Email delivery chosen but mail settings are incomplete")
-            finish()
+            onRoundComplete()
             return
         }
         val subject = context.getString(R.string.mail_subject)
@@ -190,7 +216,7 @@ class LocationReporter(
             if (!waitForNetwork()) Log.w(TAG, "No network after waiting; trying to send anyway")
             val ok = EmailSender.send(config, subject, body)
             Log.i(TAG, if (ok) "Location email sent" else "Location email failed")
-            handler.post { finish() }
+            handler.post { onRoundComplete() }
         }, "theft-email").start()
     }
 
@@ -225,5 +251,9 @@ class LocationReporter(
         private const val GOOD_ACCURACY_M = 25f
         private const val NETWORK_WAIT_TRIES = 15
         private const val NETWORK_WAIT_STEP_MS = 3_000L
+
+        /** Live tracking: send a pin this often, for at most this long. */
+        private const val LIVE_INTERVAL_MS = 60_000L
+        private const val LIVE_MAX_MS = 30 * 60_000L
     }
 }

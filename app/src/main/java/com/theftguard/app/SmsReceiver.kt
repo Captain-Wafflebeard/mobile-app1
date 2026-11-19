@@ -7,10 +7,15 @@ import android.provider.Telephony
 import android.util.Log
 
 /**
- * Watches incoming SMS and reacts to two exact keywords:
- *  - [AlarmState.TRIGGER_TEXT] ("Stolen") -> the loud alarm.
- *  - [AlarmState.SILENT_TRIGGER_TEXT] ("silent_stolen") -> silent location run.
- * Any other text, including different capitalisation or extra words, is ignored.
+ * Watches incoming SMS and reacts to exact keywords:
+ *  - "Stolen"                      -> loud alarm + one location.
+ *  - "Stolen_live"                 -> loud alarm + live location until unlock/timeout.
+ *  - "silent_stolen"               -> silent, one location.
+ *  - "silent_stolen_live"          -> silent, live location until "stop_stolen"/timeout.
+ *  - "silent_stolen_<number>"      -> silent, one location texted to <number>.
+ *  - "silent_stolen_live_<number>" -> silent, live location texted to <number>.
+ *  - "stop_stolen"                 -> stop any running alarm / live run.
+ * Matching is exact and case-sensitive (bar surrounding whitespace); anything else is ignored.
  */
 class SmsReceiver : BroadcastReceiver() {
 
@@ -27,15 +32,33 @@ class SmsReceiver : BroadcastReceiver() {
             .mapValues { (_, msgs) -> msgs.joinToString("") { it.displayMessageBody.orEmpty() } }
             .values
 
-        when {
-            // Loud alarm wins if both somehow arrive together.
-            bodies.any(::isTrigger) -> {
-                Log.w(TAG, "Trigger SMS received, starting loud theft alarm")
-                AlarmService.start(context, silent = false)
+        // Pick the single most important command across all messages received.
+        val command = bodies.mapNotNull { parse(it.trim()) }.minByOrNull { it.priority } ?: return
+        command.run(context)
+    }
+
+    /** A recognised instruction, lower priority number = wins when several arrive at once. */
+    private sealed class Command(val priority: Int) {
+        abstract fun run(context: Context)
+
+        object Stop : Command(0) {
+            override fun run(context: Context) {
+                Log.w(TAG, "Stop keyword received")
+                AlarmService.stopAll(context)
             }
-            bodies.any(::isSilentTrigger) -> {
-                Log.w(TAG, "Silent trigger SMS received, starting silent location run")
-                AlarmService.start(context, silent = true)
+        }
+
+        data class Loud(val live: Boolean) : Command(1) {
+            override fun run(context: Context) {
+                Log.w(TAG, "Loud trigger (live=$live)")
+                AlarmService.start(context, silent = false, live = live)
+            }
+        }
+
+        data class Silent(val live: Boolean, val target: String?) : Command(2) {
+            override fun run(context: Context) {
+                Log.w(TAG, "Silent trigger (live=$live, target=${target != null})")
+                AlarmService.start(context, silent = true, live = live, target = target)
             }
         }
     }
@@ -43,12 +66,20 @@ class SmsReceiver : BroadcastReceiver() {
     companion object {
         private const val TAG = "SmsReceiver"
 
-        /**
-         * Only the exact words count. Leading/trailing whitespace is ignored
-         * because some phones and carriers append a newline or space.
-         */
+        // silent_stolen, optional _live, optional _<number> (3-15 digits, optional leading +).
+        private val SILENT = Regex("""^silent_stolen(_live)?(?:_(\+?\d{3,15}))?$""")
+
+        private fun parse(text: String): Command? = when {
+            text == "stop_stolen" -> Command.Stop
+            text == AlarmState.TRIGGER_TEXT -> Command.Loud(live = false)
+            text == "${AlarmState.TRIGGER_TEXT}_live" -> Command.Loud(live = true)
+            else -> SILENT.matchEntire(text)?.let { m ->
+                Command.Silent(live = m.groupValues[1].isNotEmpty(), target = m.groupValues[2].ifEmpty { null })
+            }
+        }
+
         fun isTrigger(body: String): Boolean = body.trim() == AlarmState.TRIGGER_TEXT
 
-        fun isSilentTrigger(body: String): Boolean = body.trim() == AlarmState.SILENT_TRIGGER_TEXT
+        fun isSilentTrigger(body: String): Boolean = SILENT.matches(body.trim())
     }
 }

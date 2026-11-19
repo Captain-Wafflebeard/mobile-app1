@@ -21,7 +21,9 @@ object ShizukuManager {
 
     private var service: IUserService? = null
     private var binding = false
-    private var runWhenConnected = false
+
+    /** What to run once the user service is connected (null = nothing pending). */
+    private var pendingSilent: Boolean? = null
 
     fun isAvailable(): Boolean = try {
         Shizuku.pingBinder()
@@ -52,9 +54,10 @@ object ShizukuManager {
             } else {
                 null
             }
-            if (runWhenConnected) {
-                runWhenConnected = false
-                turnConnectivityOn()
+            if (pendingSilent != null) {
+                val silent = pendingSilent!!
+                pendingSilent = null
+                applyActions(silent)
             }
         }
 
@@ -72,7 +75,7 @@ object ShizukuManager {
             )
                 .daemon(false)
                 .processNameSuffix("shizuku")
-                .version(2)
+                .version(3)
             Shizuku.bindUserService(args, connection)
         } catch (e: Throwable) {
             binding = false
@@ -80,21 +83,28 @@ object ShizukuManager {
         }
     }
 
-    /** Turn on mobile data, Wi-Fi and location. Called when the alarm starts. */
-    fun enableConnectivity(context: Context) {
+    /**
+     * Turn on mobile data, Wi-Fi and location, and set Do Not Disturb to match the
+     * run: off for the loud alarm (so it is heard, notably on Samsung), total silence
+     * for the covert run. Called when the alarm starts; a no-op without Shizuku.
+     */
+    fun applyForAlarm(context: Context, silent: Boolean) {
         if (!hasPermission()) return
         if (service != null) {
-            turnConnectivityOn()
+            applyActions(silent)
         } else {
-            runWhenConnected = true
+            pendingSilent = silent
             bind(context.applicationContext)
         }
     }
 
-    private fun turnConnectivityOn() {
+    private fun applyActions(silent: Boolean) {
         val svc = service ?: return
         runCatching { svc.enableMobileData() }.onFailure { Log.w(TAG, "enableMobileData failed", it) }
         runCatching { svc.enableWifi() }.onFailure { Log.w(TAG, "enableWifi failed", it) }
         runCatching { svc.enableLocation() }.onFailure { Log.w(TAG, "enableLocation failed", it) }
+        runCatching {
+            if (silent) svc.turnDndTotalSilence() else svc.turnDndOff()
+        }.onFailure { Log.w(TAG, "DND change failed", it) }
     }
 }
