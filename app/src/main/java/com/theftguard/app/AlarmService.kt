@@ -14,6 +14,7 @@ import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.database.ContentObserver
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
@@ -118,6 +119,7 @@ class AlarmService : Service() {
         overrideDoNotDisturb()
         rememberOriginalVolumes()
         startVolumeEnforcement()
+        requestAlarmAudioFocus()
         registerUnlockReceiver()
         initTextToSpeech()
         locationReporter = LocationReporter(this, live = live, overrideNumber = target).apply { start() }
@@ -193,6 +195,7 @@ class AlarmService : Service() {
         soundThread?.interrupt()
         soundThread = null
 
+        abandonAlarmAudioFocus()
         restoreOriginalVolumes()
         restoreDoNotDisturb()
 
@@ -360,6 +363,28 @@ class AlarmService : Service() {
         .setUsage(AudioAttributes.USAGE_ALARM)
         .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
         .build()
+
+    private var focusRequest: AudioFocusRequest? = null
+
+    /**
+     * Some OEMs (notably Samsung) won't route a third-party alarm track while Do
+     * Not Disturb is on unless the app holds alarm audio focus. Request it so the
+     * siren actually plays through DND.
+     */
+    private fun requestAlarmAudioFocus() {
+        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(alarmAttributes)
+            .setWillPauseWhenDucked(false)
+            .build()
+        focusRequest = request
+        runCatching { audioManager.requestAudioFocus(request) }
+            .onFailure { Log.w(TAG, "requestAudioFocus failed", it) }
+    }
+
+    private fun abandonAlarmAudioFocus() {
+        focusRequest?.let { runCatching { audioManager.abandonAudioFocusRequest(it) } }
+        focusRequest = null
+    }
 
     private fun initTextToSpeech() {
         // TTS may be unavailable (e.g. before first unlock after reboot); the siren still plays.
